@@ -134,7 +134,7 @@ struct WhiteboardView: View {
                     Button("绑定") { board.groupSelection(); save(showStatus: false) }
                     Button("取消编组") { board.ungroupSelection(); save(showStatus: false) }
                     Divider()
-                    ForEach(colorChoices, id: \.value) { color in
+                    ForEach(colorChoices) { color in
                         Button(color.label) {
                             board.changeSelectedTextColor(color.value)
                             save(showStatus: false)
@@ -281,16 +281,22 @@ struct WhiteboardView: View {
         return AttributedString(text)
     }
 
-    private var colorChoices: [(label: String, value: String)] {
+    private var colorChoices: [WhiteboardColorChoice] {
         [
-            ("黑色", "#000000"),
-            ("红色", "#DC2626"),
-            ("蓝色", "#2563EB"),
-            ("绿色", "#16A34A"),
-            ("橙色", "#F97316"),
-            ("紫色", "#7C3AED")
+            WhiteboardColorChoice(label: "黑色", value: "#000000"),
+            WhiteboardColorChoice(label: "红色", value: "#DC2626"),
+            WhiteboardColorChoice(label: "蓝色", value: "#2563EB"),
+            WhiteboardColorChoice(label: "绿色", value: "#16A34A"),
+            WhiteboardColorChoice(label: "橙色", value: "#F97316"),
+            WhiteboardColorChoice(label: "紫色", value: "#7C3AED")
         ]
     }
+}
+
+private struct WhiteboardColorChoice: Identifiable {
+    var label: String
+    var value: String
+    var id: String { value }
 }
 
 private struct WhiteboardCanvasView: UIViewRepresentable {
@@ -570,11 +576,11 @@ private final class WhiteboardCanvasUIView: UIView {
         let size = max(5, wbCGFloat(config["size"], defaultValue: 20))
         UIColor(hex: wbString(config["strokeStyle"], defaultValue: "#dfe0e1")).setStroke()
         context.setLineWidth(max(0.5, wbCGFloat(config["lineWidth"], defaultValue: 1)))
-        for x in stride(from: -4000 as CGFloat, through: 4000, by: size) {
+        for x in stride(from: CGFloat(-4000), through: CGFloat(4000), by: size) {
             context.move(to: CGPoint(x: x, y: -4000))
             context.addLine(to: CGPoint(x: x, y: 4000))
         }
-        for y in stride(from: -4000 as CGFloat, through: 4000, by: size) {
+        for y in stride(from: CGFloat(-4000), through: CGFloat(4000), by: size) {
             context.move(to: CGPoint(x: -4000, y: y))
             context.addLine(to: CGPoint(x: 4000, y: y))
         }

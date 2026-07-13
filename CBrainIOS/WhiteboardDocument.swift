@@ -68,7 +68,7 @@ final class WhiteboardDocument: ObservableObject {
     func undo() {
         guard let data = undoStack.popLast(),
               let current = try? JSONSerialization.data(withJSONObject: document, options: [.sortedKeys]),
-              let previous = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let previous = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             status = "没有可撤销的操作"
             return
         }
@@ -81,7 +81,7 @@ final class WhiteboardDocument: ObservableObject {
     func redo() {
         guard let data = redoStack.popLast(),
               let current = try? JSONSerialization.data(withJSONObject: document, options: [.sortedKeys]),
-              let next = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let next = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             status = "没有可前进的操作"
             return
         }
@@ -388,7 +388,7 @@ final class WhiteboardDocument: ObservableObject {
         if source.isEmpty,
            let text = UIPasteboard.general.string,
            let data = text.data(using: .utf8),
-           let parsed = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
             source = parsed
         }
         guard !source.isEmpty else { return }
