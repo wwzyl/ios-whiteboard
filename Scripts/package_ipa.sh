@@ -7,6 +7,7 @@ DERIVED_DATA="${BUILD_DIR}/DerivedData"
 IPA_DIR="${BUILD_DIR}/ipa"
 APP_PATH="${DERIVED_DATA}/Build/Products/Release-iphoneos/CBrainIOS.app"
 IPA_PATH="${IPA_DIR}/CBrainIOS.ipa"
+LOG_PATH="${BUILD_DIR}/xcodebuild.log"
 
 rm -rf "${BUILD_DIR}"
 mkdir -p "${IPA_DIR}"
@@ -19,7 +20,7 @@ xcodebuild \
   -derivedDataPath "${DERIVED_DATA}" \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
-  clean build
+  clean build 2>&1 | tee "${LOG_PATH}"
 
 if [[ ! -d "${APP_PATH}" ]]; then
   echo "App bundle not found: ${APP_PATH}" >&2

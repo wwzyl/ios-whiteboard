@@ -205,7 +205,7 @@ final class WhiteboardRepository {
     }
 
     private static func cleanJsonData(_ data: Data) -> Data {
-        guard data.prefix(3) == Data([0xEF, 0xBB, 0xBF]) else { return data }
+        guard Data(data.prefix(3)) == Data([0xEF, 0xBB, 0xBF]) else { return data }
         return Data(data.dropFirst(3))
     }
 }
