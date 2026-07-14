@@ -437,7 +437,7 @@ final class WhiteboardDocument: ObservableObject {
         element["style"] = style
         let raw = rawTextForLayout(element)
         rememberRawText(&element, raw)
-        let width = max(30, measuredTextWidth(element, text: raw))
+        let width = max(30, wbCGFloat(element["width"], defaultValue: measuredTextWidth(element, text: raw)))
         let wrapped = wrapTextForWidth(raw, fontSize: newFontSize, width: width)
         element["text"] = wrapped
         element["width"] = width

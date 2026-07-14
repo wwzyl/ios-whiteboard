@@ -391,134 +391,111 @@ struct ContentView: View {
     private var detail: some View {
         if let selected = model.selectedNode {
             GeometryReader { geometry in
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(spacing: 4) {
+            let noteHeight = min(
+                max(220, geometry.size.height * 0.65),
+                max(180, geometry.size.height - 224)
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         Text(model.libraryName)
-                            .font(.subheadline.weight(.semibold))
+                            .font(.caption.weight(.semibold))
                             .lineLimit(1)
-                        Spacer()
-                        compactButton("主页", "house") {
-                            model.homeNode()
-                        }
-                        compactButton("选择", "folder.badge.plus") {
-                            showingFolderPicker = true
-                        }
+                            .frame(maxWidth: 140, alignment: .leading)
+                        compactButton("选择", "folder.badge.plus") { showingFolderPicker = true }
+                        compactButton("搜索", "magnifyingglass") { showingSearchSheet = true }
+                        compactButton("白板", "square.and.pencil") { openCurrentWhiteboard() }
+                        compactButton("+父", "arrow.up.left") { addRelationAction = .parent }
+                        compactButton("+子", "arrow.down.right") { addRelationAction = .child }
+                        compactButton("+相关", "link") { addRelationAction = .related }
+                        compactButton("上", "chevron.left") { model.openHistory(-1) }
+                        compactButton("随机", "shuffle") { model.openRandomNote() }
+                        compactButton("下", "chevron.right") { model.openHistory(1) }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                }
+                .frame(height: 40)
+                .background(Color(.systemGroupedBackground))
 
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(selected.topic)
+                        .font(.headline.weight(.semibold))
+                        .lineLimit(1)
+                    HStack(alignment: .top, spacing: 8) {
+                        RelationStrip(title: "父", nodes: model.parents, relation: .parent, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
+                            .frame(maxWidth: .infinity)
+                        RelationStrip(title: "兄弟", nodes: model.siblings, relation: .sibling, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: { _, _ in })
+                            .frame(maxWidth: .infinity)
+                    }
+                    HStack(alignment: .top, spacing: 8) {
+                        RelationStrip(title: "子", nodes: model.children, relation: .child, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
+                            .frame(maxWidth: .infinity)
+                        RelationStrip(title: "相关", nodes: model.related, relation: .related, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .frame(height: 104, alignment: .top)
+
+                ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        compactButton("搜索", "magnifyingglass") {
-                            showingSearchSheet = true
-                        }
-                        compactButton("白板", "square.and.pencil") {
-                            openCurrentWhiteboard()
-                        }
-                        compactButton("+父", "arrow.up.left") {
-                            addRelationAction = .parent
-                        }
-                        compactButton("+子", "arrow.down.right") {
-                            addRelationAction = .child
-                        }
-                        compactButton("+相关", "link") {
-                            addRelationAction = .related
-                        }
-                        Menu {
-                            Button("改名") { begin(.rename) }
-                            Button("删除", role: .destructive) { confirmDelete = true }
+                        Button {
+                            model.saveCurrentNote()
                         } label: {
-                            Label("更多", systemImage: "ellipsis.circle")
-                                .font(.caption)
+                            Label("保存", systemImage: "checkmark.circle")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(model.selectedNode == nil || !model.noteDirty)
+
+                        Button {
+                            editorCommand = EditorWrapCommand(before: "**", after: "**")
+                        } label: {
+                            Label("加粗", systemImage: "bold")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(previewMode)
+
+                        Button {
+                            editorCommand = EditorWrapCommand(before: "==", after: "==")
+                        } label: {
+                            Label("高亮", systemImage: "highlighter")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(previewMode)
+
+                        Button {
+                            copyReferenceLink()
+                        } label: {
+                            Label("引用", systemImage: "link")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(selectedNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Picker("模式", selection: $previewMode) {
+                            Text("编辑").tag(false)
+                            Text("预览").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 112)
+
+                        Button {
+                            showingFullEditor = true
+                        } label: {
+                            Label("最大", systemImage: "arrow.up.left.and.arrow.down.right")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
-
-                    HStack(spacing: 6) {
-                        compactButton("上", "chevron.left") {
-                            model.openHistory(-1)
-                        }
-                        compactButton("随机节点", "shuffle") {
-                            model.openRandomNote()
-                        }
-                        compactButton("S3", "arrow.triangle.2.circlepath") {
-                            showingS3Settings = true
-                        }
-                        compactButton("下", "chevron.right") {
-                            model.openHistory(1)
-                        }
-                    }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(Color(.systemGroupedBackground))
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(selected.topic)
-                        .font(.title2.weight(.semibold))
-                        .lineLimit(2)
-                    RelationStrip(title: "父节点", nodes: model.parents, relation: .parent, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
-                    RelationStrip(title: "兄弟", nodes: model.siblings, relation: .sibling, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: { _, _ in })
-                    RelationStrip(title: "子节点", nodes: model.children, relation: .child, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
-                    RelationStrip(title: "相关", nodes: model.related, relation: .related, previewedNodeId: model.selectedNode?.id, onTap: model.graphNodeTapped, onOpen: model.selectGraphNode, onDelete: model.removeRelation)
-                }
-                .padding([.horizontal, .top], 16)
-                .frame(maxHeight: max(120, geometry.size.height * 0.22), alignment: .top)
-
-                HStack(spacing: 8) {
-                    Button {
-                        model.saveCurrentNote()
-                    } label: {
-                        Label("保存", systemImage: "checkmark.circle")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(model.selectedNode == nil || !model.noteDirty)
-
-                    Button {
-                        editorCommand = EditorWrapCommand(before: "**", after: "**")
-                    } label: {
-                        Label("加粗", systemImage: "bold")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(previewMode)
-
-                    Button {
-                        editorCommand = EditorWrapCommand(before: "==", after: "==")
-                    } label: {
-                        Label("高亮", systemImage: "highlighter")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(previewMode)
-
-                    Button {
-                        copyReferenceLink()
-                    } label: {
-                        Label("引用", systemImage: "link")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(selectedNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                    Spacer()
-
-                    Picker("模式", selection: $previewMode) {
-                        Text("编辑").tag(false)
-                        Text("预览").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 128)
-
-                    Button {
-                        showingFullEditor = true
-                    } label: {
-                        Label("最大", systemImage: "arrow.up.left.and.arrow.down.right")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                .padding(.horizontal, 16)
+                .frame(height: 32)
+                .padding(.horizontal, 12)
+                .font(.caption)
 
                 if previewMode {
                     ScrollView {
@@ -527,7 +504,7 @@ struct ContentView: View {
                             .padding(16)
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: max(260, geometry.size.height * 0.65))
+                    .frame(height: noteHeight)
                     .background(Color(.systemBackground))
                     .overlay(alignment: .top) {
                         Divider()
@@ -540,7 +517,7 @@ struct ContentView: View {
                         .background(Color(.systemBackground))
                         .padding(.horizontal, 12)
                         .frame(maxWidth: .infinity)
-                        .frame(height: max(260, geometry.size.height * 0.65))
+                        .frame(height: noteHeight)
                         .overlay(alignment: .top) {
                             Divider()
                         }
@@ -548,16 +525,13 @@ struct ContentView: View {
                             showingFullEditor = true
                         }
                 }
-                if !model.whiteboardStatus.isEmpty || !model.status.isEmpty {
-                    Text([model.whiteboardStatus, model.status].filter { !$0.isEmpty }.joined(separator: "  "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 6)
-                        .background(Color(.secondarySystemGroupedBackground))
-                }
+                Text([model.whiteboardStatus, model.status].filter { !$0.isEmpty }.joined(separator: "  "))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .background(Color(.secondarySystemGroupedBackground))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGroupedBackground))
@@ -758,24 +732,27 @@ private struct RelationStrip: View {
     var onDelete: (CBrainNode, RelationKind) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 4) {
             Text(title)
-                .font(.caption.weight(.semibold))
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .leading)
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
+                HStack(spacing: 4) {
                     if nodes.isEmpty {
                         Text("None")
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .frame(minWidth: 54, alignment: .leading)
+                            .frame(minWidth: 36, alignment: .leading)
                     } else {
                         ForEach(nodes) { node in
                             Button {
                                 onTap(node)
                             } label: {
                                 Text(node.topic)
+                                    .font(.caption2)
                                     .lineLimit(1)
+                                    .frame(maxWidth: 120)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -805,6 +782,7 @@ private struct RelationStrip: View {
                 }
             }
         }
+        .frame(height: 30)
     }
 }
 
