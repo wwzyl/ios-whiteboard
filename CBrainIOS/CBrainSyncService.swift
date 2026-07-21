@@ -21,12 +21,13 @@ final class CBrainSyncService {
     private static let localTombstonesPath = ".cbrain-tombstones.json"
     private static let localGraphBasePath = ".cbrain-sync/ios-graph-base.json"
     private static let localDrawingsBasePath = ".cbrain-sync/ios-drawings-base.json"
+    private static let localRemoteDeltaPath = ".cbrain-sync/ios-remote-delta.json"
     private static let lockPrefix = ".cbrain-sync/locks/"
     private static let syncLockType = "sync"
     private static let exclusiveLockType = "exclusive"
     private static let lockClientType = "mobile"
-    private static let lockTimeoutMS: Int64 = 2 * 60 * 1000
-    private static let lockRefreshIntervalMS: Int64 = 30 * 1000
+    private static let lockTimeoutMS: Int64 = 3 * 60 * 1000
+    private static let lockRefreshIntervalMS: Int64 = 60 * 1000
     private static let deleteFailSafePercent = 90
     private static let deleteFailSafeMinimum = 10
 
@@ -75,11 +76,6 @@ final class CBrainSyncService {
             )
             try await syncFiles(local: local, remote: remote, previous: previous, result: &result)
 
-            let imported = try importOrphanNotes()
-            if imported > 0 {
-                try await upload("graph.json")
-                result.uploaded += 1
-            }
             try saveGraphBase()
             try saveDrawingsBase()
 
@@ -557,7 +553,15 @@ final class CBrainSyncService {
         } else {
             progress("No remote manifest. Building one from S3 objects...")
         }
-        return try await scanRemoteObjects(cached: cached)
+        if store.exists(Self.localRemoteDeltaPath) {
+            let localDelta = try Self.parseManifest(String(decoding: store.readData(Self.localRemoteDeltaPath), as: UTF8.self))
+            for (path, meta) in localDelta where !meta.eTag.isEmpty {
+                cached[path] = meta
+            }
+        }
+        let output = try await scanRemoteObjects(cached: cached)
+        try store.writeData(Self.localRemoteDeltaPath, Data(try manifestJSON(output).utf8))
+        return output
     }
 
     private func scanRemoteObjects(cached: [String: FileMeta]) async throws -> [String: FileMeta] {
@@ -565,10 +569,19 @@ final class CBrainSyncService {
         let root = config.rootKey("")
         let listPrefix = root.isEmpty ? "" : root + "/"
         let objects = try await s3.listObjects(prefix: listPrefix)
+        try await ensureSyncTargetVersion()
+        var fetched = 0
         for object in objects {
             try await refreshLockIfNeeded()
             guard let path = remotePath(key: object.key, root: root), !Self.skipLocal(path) else { continue }
+            if let cachedMeta = cached[path], !cachedMeta.eTag.isEmpty,
+               cachedMeta.eTag == object.eTag, cachedMeta.size == object.size {
+                output[path] = cachedMeta
+                continue
+            }
             guard let bytes = try await s3.getObject(object.key) else { continue }
+            fetched += 1
+            if fetched % 10 == 0 { progress("Fetching changed remote files \(fetched)...") }
             let sha256 = S3StorageClient.sha256Hex(bytes)
             let fallback = cached[path]?.sha256 == sha256 ? cached[path]!.modifiedTime : object.lastModified
             let modifiedTime = Self.effectiveModifiedTime(path: path, bytes: bytes, fallback: fallback)
@@ -576,7 +589,8 @@ final class CBrainSyncService {
                 path: path,
                 sha256: sha256,
                 size: Int64(bytes.count),
-                modifiedTime: modifiedTime
+                modifiedTime: modifiedTime,
+                eTag: object.eTag
             )
         }
         return output
@@ -708,13 +722,6 @@ final class CBrainSyncService {
         return folder.isEmpty || folder == "." ? conflictName : folder + "/" + conflictName
     }
 
-    private func importOrphanNotes() throws -> Int {
-        guard store.exists("graph.json") && store.exists("notes") else { return 0 }
-        let repo = CBrainRepository(store: store)
-        try repo.load()
-        return try repo.importOrphanMarkdownNotes()
-    }
-
     private func saveGraphBase() throws {
         if store.exists("graph.json") {
             try store.writeData(Self.localGraphBasePath, store.readData("graph.json"))
@@ -739,7 +746,8 @@ final class CBrainSyncService {
             fileJSON[path] = [
                 "sha256": meta.sha256,
                 "size": meta.size,
-                "modifiedTime": meta.modifiedTime
+                "modifiedTime": meta.modifiedTime,
+                "eTag": meta.eTag
             ]
         }
         let root: [String: Any] = [
@@ -768,7 +776,8 @@ final class CBrainSyncService {
                 path: path,
                 sha256: item["sha256"] as? String ?? "",
                 size: int64(item["size"]),
-                modifiedTime: int64(item["modifiedTime"])
+                modifiedTime: int64(item["modifiedTime"]),
+                eTag: item["eTag"] as? String ?? ""
             )
         }
         return output
@@ -1032,6 +1041,7 @@ private struct FileMeta: Equatable {
     var sha256: String
     var size: Int64
     var modifiedTime: Int64
+    var eTag: String = ""
 }
 
 private struct Tombstone {

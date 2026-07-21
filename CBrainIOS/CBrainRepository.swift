@@ -21,22 +21,6 @@ final class CBrainRepository {
         links = dictionaryOfDictionaries(root["links"])
     }
 
-    func importOrphanMarkdownNotes() throws -> Int {
-        var imported = 0
-        for fileName in store.listMarkdownFiles("notes") {
-            let base = Self.stripMarkdownExtension(fileName)
-            if base.isEmpty || Self.isConflictFile(base) || nodeByFileName(base) != nil {
-                continue
-            }
-            _ = createNodeForExistingNote(fileName: base)
-            imported += 1
-        }
-        if imported > 0 {
-            try saveGraph()
-        }
-        return imported
-    }
-
     func activeNodes() -> [CBrainNode] {
         nodes.keys.compactMap { self.node($0) }.filter(\.isActive).sorted {
             $0.topic.localizedStandardCompare($1.topic) == .orderedAscending

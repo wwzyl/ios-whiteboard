@@ -5,6 +5,7 @@ struct S3ObjectInfo {
     var key: String
     var size: Int64
     var lastModified: Int64
+    var eTag: String
 }
 
 struct S3ObjectVersion {
@@ -133,6 +134,22 @@ final class S3StorageClient {
     }
 
     private func execute(_ request: S3Request) async throws -> S3Response {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                let response = try await executeOnce(request)
+                if response.code != 429 && response.code < 500 { return response }
+                if attempt == 2 { return response }
+            } catch {
+                lastError = error
+                if attempt == 2 { throw error }
+            }
+            try await Task.sleep(nanoseconds: UInt64(250_000_000 * (attempt + 1)))
+        }
+        throw lastError ?? CBrainError.message("S3 request failed")
+    }
+
+    private func executeOnce(_ request: S3Request) async throws -> S3Response {
         let payloadHash = Self.sha256Hex(request.body)
         let amzDate = Self.amzDate()
         let dateStamp = String(amzDate.prefix(8))
@@ -285,6 +302,7 @@ private final class ListXMLParser: NSObject, XMLParserDelegate {
     private var key = ""
     private var size: Int64 = 0
     private var lastModified: Int64 = 0
+    private var eTag = ""
 
     static func parse(_ data: Data) throws -> S3ListResult {
         let delegate = ListXMLParser()
@@ -304,6 +322,7 @@ private final class ListXMLParser: NSObject, XMLParserDelegate {
             key = ""
             size = 0
             lastModified = 0
+            eTag = ""
         }
     }
 
@@ -320,9 +339,11 @@ private final class ListXMLParser: NSObject, XMLParserDelegate {
                 size = Int64(text) ?? 0
             } else if elementName == "LastModified" {
                 lastModified = Self.parseS3Date(text)
+            } else if elementName == "ETag" {
+                eTag = text
             } else if elementName == "Contents" {
                 if !key.isEmpty && !key.hasSuffix("/") {
-                    result.objects.append(S3ObjectInfo(key: key, size: size, lastModified: lastModified))
+                    result.objects.append(S3ObjectInfo(key: key, size: size, lastModified: lastModified, eTag: eTag))
                 }
                 inContents = false
             }

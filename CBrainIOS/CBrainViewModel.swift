@@ -225,12 +225,6 @@ final class CBrainViewModel: ObservableObject {
         guard let repository else { return }
         do {
             var home = repository.nodeByMarkdownFile("日记库.md")
-            if home == nil {
-                _ = try repository.importOrphanMarkdownNotes()
-                try repository.load()
-                refresh()
-                home = repository.nodeByMarkdownFile("日记库.md")
-            }
             guard let home, home.isActive else {
                 status = "找不到日记库.md"
                 return
@@ -405,7 +399,6 @@ final class CBrainViewModel: ObservableObject {
         do {
             let repository = CBrainRepository(store: store)
             try repository.load()
-            let imported = try repository.importOrphanMarkdownNotes()
             self.store = store
             self.repository = repository
             libraryName = store.displayName
@@ -424,7 +417,7 @@ final class CBrainViewModel: ObservableObject {
             if selectedNode == nil, let first = modelInitialNode(repository: repository) {
                 selectNode(first, updateGraph: true)
             }
-            status = imported > 0 ? "已导入 \(imported) 个孤立笔记" : "已打开"
+            status = "已打开"
         } catch {
             report(error)
         }
