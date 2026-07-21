@@ -251,7 +251,6 @@ final class CBrainSyncService {
     }
 
     private func uploadDeletionEvents(_ tombstones: [String: Tombstone]) async throws {
-        var processedDeletes = 0
         for tombstone in tombstones.values {
             try await refreshLockIfNeeded()
             let event: [String: Any] = [
@@ -325,6 +324,7 @@ final class CBrainSyncService {
         try Self.assertDeletionSafe(side: "local", deletes: localDeletes, total: local.count)
         try Self.assertDeletionSafe(side: "remote", deletes: remoteDeletes, total: remote.count)
 
+        var processedDeletes = 0
         for tombstone in tombstones.values {
             try await refreshLockIfNeeded()
             if tombstone.path == "graph.json" { continue }
