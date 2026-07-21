@@ -944,6 +944,14 @@ private struct S3SettingsView: View {
                 }
                 .disabled(model.isSyncing)
 
+                if model.isSyncing {
+                    Button(role: .destructive) {
+                        model.cancelS3Sync()
+                    } label: {
+                        Label("Cancel sync", systemImage: "xmark.circle")
+                    }
+                }
+
                 Button {
                     config.save()
                     dismiss()

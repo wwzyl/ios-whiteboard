@@ -251,6 +251,7 @@ final class CBrainSyncService {
     }
 
     private func uploadDeletionEvents(_ tombstones: [String: Tombstone]) async throws {
+        var processedDeletes = 0
         for tombstone in tombstones.values {
             try await refreshLockIfNeeded()
             let event: [String: Any] = [
@@ -351,6 +352,15 @@ final class CBrainSyncService {
                 remote.removeValue(forKey: tombstone.path)
                 result.deletedRemote += 1
             }
+            if deleteLocal || deleteRemote {
+                processedDeletes += 1
+                if processedDeletes % 50 == 0 {
+                    try store.writeData(Self.localRemoteDeltaPath, Data(try manifestJSON(remote).utf8))
+                }
+            }
+        }
+        if processedDeletes > 0 {
+            try store.writeData(Self.localRemoteDeltaPath, Data(try manifestJSON(remote).utf8))
         }
     }
 
@@ -673,6 +683,10 @@ final class CBrainSyncService {
                     throw CBrainError.message("Sync target is being upgraded")
                 }
             } else if lock.key != lockKey() {
+                if lock.key == syncLockKey() {
+                    try await s3.deleteObject(lock.key)
+                    continue
+                }
                 throw CBrainError.message("Cannot acquire exclusive lock while sync target is active")
             }
         }
@@ -709,6 +723,7 @@ final class CBrainSyncService {
     }
 
     private func refreshLockIfNeeded() async throws {
+        try Task.checkCancellation()
         let now = Self.nowMS()
         if now - lastLockRefresh < Self.lockRefreshIntervalMS { return }
         var prefix = config.rootKey(Self.lockPrefix)
@@ -746,6 +761,10 @@ final class CBrainSyncService {
 
     private func lockKey() -> String {
         config.rootKey(Self.lockPrefix + activeLockType + "_" + Self.lockClientType + "_" + clientId + ".json")
+    }
+
+    private func syncLockKey() -> String {
+        config.rootKey(Self.lockPrefix + Self.syncLockType + "_" + Self.lockClientType + "_" + clientId + ".json")
     }
 
     private func legacyLockKey() -> String {

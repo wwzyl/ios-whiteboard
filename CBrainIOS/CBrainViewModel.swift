@@ -35,6 +35,7 @@ final class CBrainViewModel: ObservableObject {
     private var historyIndex = -1
     private var navigatingHistory = false
     private var loadingNote = false
+    private var syncTask: Task<Void, Never>?
     private var lastGraphTapNodeId = ""
     private var lastGraphTapTime = Date.distantPast
 
@@ -315,7 +316,7 @@ final class CBrainViewModel: ObservableObject {
         saveCurrentNote()
         isSyncing = true
         status = "准备同步..."
-        Task {
+        syncTask = Task {
             do {
                 let config = S3Config.load()
                 let service = try CBrainSyncService(store: store, config: config) { [weak self] message in
@@ -328,20 +329,32 @@ final class CBrainViewModel: ObservableObject {
                     self.reloadAfterSync()
                     self.status = result.summary
                     self.isSyncing = false
+                    self.syncTask = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isSyncing = false
+                    self.status = "Sync cancelled"
+                    self.syncTask = nil
                 }
             } catch {
                 await MainActor.run {
                     self.isSyncing = false
+                    self.syncTask = nil
                     self.report(error)
                 }
             }
         }
     }
 
+    func cancelS3Sync() {
+        syncTask?.cancel()
+    }
+
     func runS3DownloadAll() {
         isSyncing = true
         status = "准备全量下载..."
-        Task {
+        syncTask = Task {
             do {
                 let targetStore: LibraryStore
                 if let store {
@@ -364,10 +377,18 @@ final class CBrainViewModel: ObservableObject {
                     self.reloadAfterSync()
                     self.status = result.summary
                     self.isSyncing = false
+                    self.syncTask = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isSyncing = false
+                    self.status = "Sync cancelled"
+                    self.syncTask = nil
                 }
             } catch {
                 await MainActor.run {
                     self.isSyncing = false
+                    self.syncTask = nil
                     self.report(error)
                 }
             }
