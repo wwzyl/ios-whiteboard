@@ -7,6 +7,19 @@ struct S3ObjectInfo {
     var lastModified: Int64
 }
 
+struct S3ObjectVersion {
+    var body: Data
+    var eTag: String?
+}
+
+struct S3PreconditionFailedError: LocalizedError {
+    var key: String
+
+    var errorDescription: String? {
+        "S3 object changed before upload: \(key)"
+    }
+}
+
 final class S3StorageClient {
     private var config: S3Config
     private let endpoint: Endpoint
@@ -38,10 +51,32 @@ final class S3StorageClient {
         return response.body
     }
 
+    func getObjectVersion(_ key: String) async throws -> S3ObjectVersion? {
+        let response = try await execute(S3Request(method: "GET", key: key, query: nil, body: Data()))
+        if response.code == 404 { return nil }
+        guard (200..<300).contains(response.code) else {
+            throw CBrainError.message(errorMessage(action: "GET \(key)", response: response))
+        }
+        return S3ObjectVersion(body: response.body, eTag: response.eTag)
+    }
+
     func putObject(_ key: String, body: Data) async throws {
         let response = try await execute(S3Request(method: "PUT", key: key, query: nil, body: body))
         guard (200..<300).contains(response.code) else {
             throw CBrainError.message(errorMessage(action: "PUT \(key)", response: response))
+        }
+    }
+
+    func putObjectConditional(_ key: String, body: Data, expectedETag: String?) async throws {
+        let headers = expectedETag?.isEmpty == false
+            ? ["if-match": expectedETag!]
+            : ["if-none-match": "*"]
+        let response = try await execute(S3Request(method: "PUT", key: key, query: nil, body: body, headers: headers))
+        if response.code == 409 || response.code == 412 {
+            throw S3PreconditionFailedError(key: key)
+        }
+        guard (200..<300).contains(response.code) else {
+            throw CBrainError.message(errorMessage(action: "conditional PUT \(key)", response: response))
         }
     }
 
@@ -52,6 +87,26 @@ final class S3StorageClient {
         }
         guard (200..<300).contains(response.code) else {
             throw CBrainError.message(errorMessage(action: "DELETE \(key)", response: response))
+        }
+    }
+
+    func deleteObjectConditional(_ key: String, expectedETag: String?) async throws {
+        guard let expectedETag, !expectedETag.isEmpty else {
+            throw S3PreconditionFailedError(key: key)
+        }
+        let response = try await execute(S3Request(
+            method: "DELETE",
+            key: key,
+            query: nil,
+            body: Data(),
+            headers: ["if-match": expectedETag]
+        ))
+        if response.code == 404 { return }
+        if response.code == 409 || response.code == 412 {
+            throw S3PreconditionFailedError(key: key)
+        }
+        guard (200..<300).contains(response.code) else {
+            throw CBrainError.message(errorMessage(action: "conditional DELETE \(key)", response: response))
         }
     }
 
@@ -84,10 +139,17 @@ final class S3StorageClient {
         let host = endpoint.hostHeader(bucket: config.bucket)
         let canonicalURI = endpoint.canonicalURI(bucket: config.bucket, key: request.key)
         let canonicalQuery = Self.canonicalQuery(request.query)
-        let signedHeaders = "host;x-amz-content-sha256;x-amz-date"
-        let canonicalHeaders = "host:\(host)\n"
-            + "x-amz-content-sha256:\(payloadHash)\n"
-            + "x-amz-date:\(amzDate)\n"
+        var headers = [
+            "host": host,
+            "x-amz-content-sha256": payloadHash,
+            "x-amz-date": amzDate
+        ]
+        for (key, value) in request.headers {
+            headers[key.lowercased()] = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let headerNames = headers.keys.sorted()
+        let signedHeaders = headerNames.joined(separator: ";")
+        let canonicalHeaders = headerNames.map { "\($0):\(headers[$0] ?? "")\n" }.joined()
         let canonicalRequest = "\(request.method)\n\(canonicalURI)\n\(canonicalQuery)\n\(canonicalHeaders)\n\(signedHeaders)\n\(payloadHash)"
         let scope = "\(dateStamp)/\(config.region)/s3/aws4_request"
         let stringToSign = "AWS4-HMAC-SHA256\n\(amzDate)\n\(scope)\n\(Self.sha256Hex(Data(canonicalRequest.utf8)))"
@@ -100,14 +162,21 @@ final class S3StorageClient {
         urlRequest.setValue(authorization, forHTTPHeaderField: "Authorization")
         urlRequest.setValue(payloadHash, forHTTPHeaderField: "x-amz-content-sha256")
         urlRequest.setValue(amzDate, forHTTPHeaderField: "x-amz-date")
+        for (key, value) in request.headers {
+            urlRequest.setValue(value, forHTTPHeaderField: key)
+        }
         if request.method == "PUT" {
             urlRequest.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             urlRequest.httpBody = request.body
         }
 
         let (data, response) = try await session.data(for: urlRequest)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        return S3Response(code: code, body: data)
+        let httpResponse = response as? HTTPURLResponse
+        let code = httpResponse?.statusCode ?? 0
+        let eTag = httpResponse?.allHeaderFields.first { key, _ in
+            String(describing: key).lowercased() == "etag"
+        }.map { String(describing: $0.value) }
+        return S3Response(code: code, body: data, eTag: eTag)
     }
 
     private func signingKey(dateStamp: String) -> Data {
@@ -194,11 +263,13 @@ private struct S3Request {
     var key: String
     var query: [String: String]?
     var body: Data
+    var headers: [String: String] = [:]
 }
 
 private struct S3Response {
     var code: Int
     var body: Data
+    var eTag: String?
 }
 
 private struct S3ListResult {
@@ -371,4 +442,3 @@ private enum S3StorageClientUri {
         return output
     }
 }
-

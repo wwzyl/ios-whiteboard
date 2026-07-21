@@ -14,8 +14,21 @@ struct CBrainSyncResult {
 
 final class CBrainSyncService {
     private static let manifestPath = ".cbrain-sync/manifest.json"
+    private static let infoPath = ".cbrain-sync/info.json"
+    private static let syncVersion = 5
+    private static let tombstonesPath = ".cbrain-sync/tombstones.json"
+    private static let deletionsPrefix = ".cbrain-sync/deletions/"
+    private static let localTombstonesPath = ".cbrain-tombstones.json"
+    private static let localGraphBasePath = ".cbrain-sync/ios-graph-base.json"
+    private static let localDrawingsBasePath = ".cbrain-sync/ios-drawings-base.json"
     private static let lockPrefix = ".cbrain-sync/locks/"
+    private static let syncLockType = "sync"
+    private static let exclusiveLockType = "exclusive"
+    private static let lockClientType = "mobile"
     private static let lockTimeoutMS: Int64 = 2 * 60 * 1000
+    private static let lockRefreshIntervalMS: Int64 = 30 * 1000
+    private static let deleteFailSafePercent = 90
+    private static let deleteFailSafeMinimum = 10
 
     private let store: LibraryStore
     private let config: S3Config
@@ -23,6 +36,8 @@ final class CBrainSyncService {
     private let progress: (String) -> Void
     private let clientId: String
     private let stateKey: String
+    private var lastLockRefresh: Int64 = 0
+    private var activeLockType = "sync"
 
     init(store: LibraryStore, config: S3Config, progress: @escaping (String) -> Void) throws {
         self.store = store
@@ -37,13 +52,27 @@ final class CBrainSyncService {
         var result = CBrainSyncResult()
         progress("Checking S3 bucket...")
         try await s3.checkBucket()
+        try await upgradeSyncTargetVersionIfNeeded()
+        activeLockType = Self.syncLockType
         try await acquireLock()
         do {
+            try await ensureSyncTargetVersion()
             progress("Scanning local files...")
-            let local = try scanLocal()
+            var local = try scanLocal()
             let previous = try Self.parseManifest(UserDefaults.standard.string(forKey: stateKey) ?? "")
             progress("Reading remote manifest...")
-            let remote = try await readRemoteManifest()
+            var remote = try await readRemoteManifest()
+            let tombstones = try await readMergedTombstones()
+            let tombstoneData = try tombstonesJSON(tombstones)
+            try store.writeData(Self.localTombstonesPath, tombstoneData)
+            try await uploadDeletionEvents(tombstones)
+            try await applyTombstones(
+                local: &local,
+                remote: &remote,
+                previous: previous,
+                tombstones: tombstones,
+                result: &result
+            )
             try await syncFiles(local: local, remote: remote, previous: previous, result: &result)
 
             let imported = try importOrphanNotes()
@@ -51,6 +80,8 @@ final class CBrainSyncService {
                 try await upload("graph.json")
                 result.uploaded += 1
             }
+            try saveGraphBase()
+            try saveDrawingsBase()
 
             progress("Writing manifest...")
             let finalLocal = try scanLocal()
@@ -69,18 +100,24 @@ final class CBrainSyncService {
         var result = CBrainSyncResult()
         progress("Checking S3 bucket...")
         try await s3.checkBucket()
+        try await upgradeSyncTargetVersionIfNeeded()
+        activeLockType = Self.syncLockType
         try await acquireLock()
         do {
+            try await ensureSyncTargetVersion()
             progress("Reading remote manifest...")
             let remote = try await readRemoteManifest()
             let paths = remote.keys.sorted()
             for (index, path) in paths.enumerated() {
+                try await refreshLockIfNeeded()
                 if (index + 1) % 10 == 0 {
                     progress("Downloading files \(index + 1)/\(paths.count)...")
                 }
                 try await download(path, remote: remote[path])
                 result.downloaded += 1
             }
+            try saveGraphBase()
+            try saveDrawingsBase()
             let manifest = try manifestJSON(remote)
             try await s3.putObject(config.rootKey(Self.manifestPath), body: Data(manifest.utf8))
             UserDefaults.standard.set(manifest, forKey: stateKey)
@@ -93,79 +130,374 @@ final class CBrainSyncService {
     }
 
     private func syncFiles(local: [String: FileMeta], remote: [String: FileMeta], previous: [String: FileMeta], result: inout CBrainSyncResult) async throws {
+        var localState = local
+        var remoteState = remote
+        var checkpointState = previous
         let paths = Set(local.keys).union(remote.keys).union(previous.keys)
         let sortedPaths = paths.sorted()
         let firstSyncFromPopulatedRemote = previous.isEmpty && !remote.isEmpty
-
-        for (index, path) in sortedPaths.enumerated() {
-            if (index + 1) % 10 == 0 {
-                progress("Syncing files \(index + 1)/\(sortedPaths.count)...")
+        let remoteMissingDeletes = sortedPaths.reduce(into: 0) { count, path in
+            if !Self.isContainerPath(path), local[path] != nil, remote[path] == nil, previous[path] != nil,
+               Self.same(local[path], previous[path]) {
+                count += 1
             }
-            let l = local[path]
-            let r = remote[path]
+        }
+        try Self.assertDeletionSafe(side: "local after remote deletion", deletes: remoteMissingDeletes, total: local.count)
+
+        progress("Uploading local changes...")
+        for (index, path) in sortedPaths.enumerated() {
+            try await refreshLockIfNeeded()
+            if (index + 1) % 10 == 0 {
+                progress("Uploading changes \(index + 1)/\(sortedPaths.count)...")
+            }
+            let l = localState[path]
+            let r = remoteState[path]
+            let p = previous[path]
+            let localChanged = !Self.same(l, p)
+            let remoteChanged = !Self.same(r, p)
+
+            if Self.isContainerPath(path) { continue }
+            if let l, let r {
+                if firstSyncFromPopulatedRemote && p == nil && !Self.same(l, r) {
+                    try await preserveLocalAndDownload(path, remote: r, result: &result)
+                    localState[path] = r
+                    try checkpoint(&checkpointState, path: path, meta: r)
+                } else if localChanged && remoteChanged && !Self.same(l, r) {
+                    try await resolveConcurrentChange(path, local: l, remote: r, result: &result)
+                    localState[path] = r
+                    try checkpoint(&checkpointState, path: path, meta: r)
+                } else if localChanged && !remoteChanged && !Self.same(l, r) {
+                    try await uploadConditional(path, expectedRemote: r)
+                    result.uploaded += 1
+                    remoteState[path] = l
+                    try checkpoint(&checkpointState, path: path, meta: l)
+                }
+            } else if let l = l, p == nil {
+                try await uploadConditional(path, expectedRemote: nil)
+                result.uploaded += 1
+                remoteState[path] = l
+                try checkpoint(&checkpointState, path: path, meta: l)
+            }
+        }
+
+        progress("Fetching remote delta...")
+        for (index, path) in sortedPaths.enumerated() {
+            try await refreshLockIfNeeded()
+            if (index + 1) % 10 == 0 {
+                progress("Fetching changes \(index + 1)/\(sortedPaths.count)...")
+            }
+            let l = localState[path]
+            let r = remoteState[path]
             let p = previous[path]
             let localChanged = !Self.same(l, p)
             let remoteChanged = !Self.same(r, p)
 
             if let l, let r {
-                if firstSyncFromPopulatedRemote && p == nil && !Self.same(l, r) {
+                if path == "graph.json" && !Self.same(l, r) {
+                    try await mergeGraphWithRemote(r, result: &result)
+                    let mergedMeta = try scanLocal()[path]
+                    try checkpoint(&checkpointState, path: path, meta: mergedMeta)
+                } else if path == "drawings.json" && !Self.same(l, r) {
+                    try await mergeDrawingsWithRemote(r, result: &result)
+                    let mergedMeta = try scanLocal()[path]
+                    try checkpoint(&checkpointState, path: path, meta: mergedMeta)
+                } else if remoteChanged && !localChanged && !Self.same(l, r) {
                     try await download(path, remote: r)
                     result.downloaded += 1
-                } else if localChanged && remoteChanged && !Self.same(l, r) {
-                    if Self.isRemoteNewer(remote: r, local: l) {
-                        try await download(path, remote: r)
-                        result.downloaded += 1
-                    } else if Self.isLocalNewer(local: l, remote: r) {
-                        try await upload(path)
-                        result.uploaded += 1
-                    } else {
-                        let conflict = conflictPath(path)
-                        if let remoteBytes = try await s3.getObject(config.rootKey(path)) {
-                            try store.writeData(conflict, remoteBytes)
-                            result.conflicts += 1
-                        }
-                        try await upload(path)
-                        result.uploaded += 1
-                    }
-                } else if remoteChanged && !Self.same(l, r) {
-                    try await download(path, remote: r)
-                    result.downloaded += 1
-                } else if localChanged && !Self.same(l, r) {
-                    try await upload(path)
-                    result.uploaded += 1
+                    try checkpoint(&checkpointState, path: path, meta: r)
                 }
-            } else if let _ = l {
-                if firstSyncFromPopulatedRemote && p == nil {
-                    store.delete(path)
-                    result.deletedLocal += 1
+            } else if l != nil && r == nil {
+                if Self.isContainerPath(path) {
+                    try await uploadConditional(path, expectedRemote: nil)
+                    result.uploaded += 1
+                    try checkpoint(&checkpointState, path: path, meta: l)
                 } else if p != nil && !localChanged {
                     store.delete(path)
+                    store.deleteMarkdownAliases(path)
                     result.deletedLocal += 1
-                } else {
-                    try await upload(path)
-                    result.uploaded += 1
+                    try checkpoint(&checkpointState, path: path, meta: nil)
+                } else if p != nil {
+                    try await preserveLocalForDeletion(path, result: &result)
+                    store.delete(path)
+                    store.deleteMarkdownAliases(path)
+                    result.deletedLocal += 1
+                    try checkpoint(&checkpointState, path: path, meta: nil)
                 }
-            } else if let r {
-                if p != nil && !remoteChanged {
-                    try await s3.deleteObject(config.rootKey(path))
-                    result.deletedRemote += 1
-                } else if p != nil && remoteChanged {
-                    let conflict = conflictPath(path)
-                    if let remoteBytes = try await s3.getObject(config.rootKey(path)) {
-                        try store.writeData(conflict, remoteBytes)
-                        result.conflicts += 1
-                    }
-                } else {
-                    try await download(path, remote: r)
-                    result.downloaded += 1
-                }
+            } else if l == nil, let r = r {
+                try await download(path, remote: r)
+                result.downloaded += 1
+                try checkpoint(&checkpointState, path: path, meta: r)
             }
         }
+    }
+
+    private func readMergedTombstones() async throws -> [String: Tombstone] {
+        var output: [String: Tombstone] = [:]
+        if store.exists(Self.localTombstonesPath) {
+            Self.mergeTombstones(target: &output, source: try Self.parseTombstones(store.readData(Self.localTombstonesPath)))
+        }
+        if let remote = try await s3.getObject(config.rootKey(Self.tombstonesPath)), !remote.isEmpty {
+            Self.mergeTombstones(target: &output, source: try Self.parseTombstones(remote))
+        }
+        var prefix = config.rootKey(Self.deletionsPrefix)
+        if !prefix.isEmpty && !prefix.hasSuffix("/") { prefix += "/" }
+        for object in try await s3.listObjects(prefix: prefix) {
+            try await refreshLockIfNeeded()
+            guard let data = try await s3.getObject(object.key), !data.isEmpty,
+                  let event = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let path = event["path"] as? String ?? ""
+            let deletedTime = int64(event["deletedTime"])
+            if !path.isEmpty && deletedTime > 0 {
+                Self.mergeTombstones(target: &output, source: [path: Tombstone(path: path, deletedTime: deletedTime)])
+            }
+        }
+        return output
+    }
+
+    private func uploadDeletionEvents(_ tombstones: [String: Tombstone]) async throws {
+        for tombstone in tombstones.values {
+            try await refreshLockIfNeeded()
+            let event: [String: Any] = [
+                "path": tombstone.path,
+                "deletedTime": tombstone.deletedTime,
+                "clientId": clientId
+            ]
+            let data = try JSONSerialization.data(withJSONObject: event, options: [.sortedKeys])
+            let id = S3StorageClient.sha256Hex(Data(tombstone.path.utf8))
+            let key = Self.deletionsPrefix + id + "-\(tombstone.deletedTime).json"
+            try await s3.putObject(config.rootKey(key), body: data)
+        }
+    }
+
+    private func ensureSyncTargetVersion() async throws {
+        if let body = try await s3.getObject(config.rootKey(Self.infoPath)), !body.isEmpty,
+           let info = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            let version = Int(int64(info["version"]))
+            let minimumVersion = Int(int64(info["minimumVersion"]))
+            if version > Self.syncVersion || minimumVersion > Self.syncVersion {
+                throw CBrainError.message("Sync target requires protocol version \(max(version, minimumVersion))")
+            }
+            if version == Self.syncVersion && minimumVersion == Self.syncVersion { return }
+        }
+        let info: [String: Any] = [
+            "version": Self.syncVersion,
+            "minimumVersion": Self.syncVersion,
+            "updatedTime": Self.nowMS(),
+            "clientId": clientId
+        ]
+        let data = try JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])
+        try await s3.putObject(config.rootKey(Self.infoPath), body: data)
+    }
+
+    private func upgradeSyncTargetVersionIfNeeded() async throws {
+        if let body = try await s3.getObject(config.rootKey(Self.infoPath)), !body.isEmpty,
+           let info = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            let version = Int(int64(info["version"]))
+            let minimumVersion = Int(int64(info["minimumVersion"]))
+            if version > Self.syncVersion || minimumVersion > Self.syncVersion {
+                throw CBrainError.message("Sync target requires protocol version \(max(version, minimumVersion))")
+            }
+            if version == Self.syncVersion && minimumVersion == Self.syncVersion { return }
+        }
+        activeLockType = Self.exclusiveLockType
+        try await acquireLock()
+        do {
+            try await ensureSyncTargetVersion()
+            try? await releaseLock()
+            activeLockType = Self.syncLockType
+        } catch {
+            try? await releaseLock()
+            activeLockType = Self.syncLockType
+            throw error
+        }
+    }
+
+    private func applyTombstones(
+        local: inout [String: FileMeta],
+        remote: inout [String: FileMeta],
+        previous: [String: FileMeta],
+        tombstones: [String: Tombstone],
+        result: inout CBrainSyncResult
+    ) async throws {
+        var localDeletes = 0
+        var remoteDeletes = 0
+        for tombstone in tombstones.values where tombstone.path != "graph.json" {
+            if Self.tombstoneWins(tombstone, meta: local[tombstone.path]) { localDeletes += 1 }
+            if Self.tombstoneWins(tombstone, meta: remote[tombstone.path]) { remoteDeletes += 1 }
+        }
+        try Self.assertDeletionSafe(side: "local", deletes: localDeletes, total: local.count)
+        try Self.assertDeletionSafe(side: "remote", deletes: remoteDeletes, total: remote.count)
+
+        for tombstone in tombstones.values {
+            try await refreshLockIfNeeded()
+            if tombstone.path == "graph.json" { continue }
+            let l = local[tombstone.path]
+            let r = remote[tombstone.path]
+            let p = previous[tombstone.path]
+            let deleteLocal = Self.tombstoneWins(tombstone, meta: l)
+            let deleteRemote = Self.tombstoneWins(tombstone, meta: r)
+            if !deleteLocal && !deleteRemote { continue }
+
+            if deleteLocal, let l, !Self.same(l, p) {
+                try await preserveLocalForDeletion(tombstone.path, result: &result)
+            }
+            if deleteRemote, let r, !Self.same(r, p) {
+                try await preserveRemoteForDeletion(tombstone.path, result: &result)
+            }
+            if deleteLocal {
+                store.delete(tombstone.path)
+                store.deleteMarkdownAliases(tombstone.path)
+                local.removeValue(forKey: tombstone.path)
+                result.deletedLocal += 1
+            }
+            if deleteRemote {
+                try await deleteRemoteConditional(tombstone.path, expectedRemote: r)
+                remote.removeValue(forKey: tombstone.path)
+                result.deletedRemote += 1
+            }
+        }
+    }
+
+    private func deleteRemoteConditional(_ path: String, expectedRemote: FileMeta?) async throws {
+        let key = config.rootKey(path)
+        guard let version = try await s3.getObjectVersion(key) else { return }
+        guard let expectedRemote,
+              S3StorageClient.sha256Hex(version.body) == expectedRemote.sha256 else {
+            throw S3PreconditionFailedError(key: key)
+        }
+        try await s3.deleteObjectConditional(key, expectedETag: version.eTag)
+    }
+
+    private func preserveLocalForDeletion(_ path: String, result: inout CBrainSyncResult) async throws {
+        let conflict = conflictPath(path, source: "local")
+        try store.writeData(conflict, store.readData(path))
+        try await upload(conflict)
+        result.conflicts += 1
+        result.uploaded += 1
+    }
+
+    private func preserveRemoteForDeletion(_ path: String, result: inout CBrainSyncResult) async throws {
+        guard let bytes = try await s3.getObject(config.rootKey(path)) else { return }
+        let conflict = conflictPath(path, source: "remote")
+        try store.writeData(conflict, bytes)
+        try await upload(conflict)
+        result.conflicts += 1
+        result.uploaded += 1
+    }
+
+    private static func tombstoneWins(_ tombstone: Tombstone, meta: FileMeta?) -> Bool {
+        guard let meta else { return false }
+        return tombstone.deletedTime >= meta.modifiedTime
+    }
+
+    private static func assertDeletionSafe(side: String, deletes: Int, total: Int) throws {
+        if deletes >= deleteFailSafeMinimum && deletes * 100 >= max(1, total) * deleteFailSafePercent {
+            throw CBrainError.message("Sync fail-safe stopped deletion of \(deletes)/\(total) \(side) files")
+        }
+    }
+
+    private func resolveConcurrentChange(_ path: String, local: FileMeta, remote: FileMeta, result: inout CBrainSyncResult) async throws {
+        try await preserveLocalAndDownload(path, remote: remote, result: &result)
+    }
+
+    private func preserveLocalAndDownload(_ path: String, remote: FileMeta, result: inout CBrainSyncResult) async throws {
+        let conflict = conflictPath(path, source: "local")
+        try store.writeData(conflict, try store.readData(path))
+        try await upload(conflict)
+        try await download(path, remote: remote)
+        result.conflicts += 1
+        result.uploaded += 1
+        result.downloaded += 1
+    }
+
+    private func preserveRemoteAndUpload(_ path: String, result: inout CBrainSyncResult) async throws {
+        if let remoteBytes = try await s3.getObject(config.rootKey(path)) {
+            let conflict = conflictPath(path, source: "remote")
+            try store.writeData(conflict, remoteBytes)
+            try await upload(conflict)
+            result.uploaded += 1
+        }
+        try await upload(path)
+        result.conflicts += 1
+        result.uploaded += 1
     }
 
     private func upload(_ path: String) async throws {
         progress("Uploading \(path)")
         try await s3.putObject(config.rootKey(path), body: try store.readData(path))
+    }
+
+    private func uploadConditional(_ path: String, expectedRemote: FileMeta?) async throws {
+        progress("Uploading \(path)")
+        let key = config.rootKey(path)
+        let version = try await s3.getObjectVersion(key)
+        if let expectedRemote {
+            guard let version,
+                  S3StorageClient.sha256Hex(version.body) == expectedRemote.sha256 else {
+                throw S3PreconditionFailedError(key: key)
+            }
+        } else if version != nil {
+            throw S3PreconditionFailedError(key: key)
+        }
+        try await s3.putObjectConditional(key, body: try store.readData(path), expectedETag: version?.eTag)
+    }
+
+    private func mergeGraphWithRemote(_ remote: FileMeta, result: inout CBrainSyncResult) async throws {
+        progress("Merging graph.json")
+        guard let remoteVersion = try await s3.getObjectVersion(config.rootKey("graph.json")) else { return }
+        let remoteBytes = remoteVersion.body
+        let localBytes = try store.readData("graph.json")
+        let baseBytes: Data?
+        if store.exists(Self.localGraphBasePath) {
+            baseBytes = try store.readData(Self.localGraphBasePath)
+        } else {
+            baseBytes = nil
+        }
+        let merged = try Self.mergeGraphData(local: localBytes, remote: remoteBytes, base: baseBytes)
+        if merged.conflicts > 0 {
+            let conflict = conflictPath("graph.json", source: "local")
+            try store.writeData(conflict, localBytes)
+            try await upload(conflict)
+            result.uploaded += 1
+        }
+        try store.writeData("graph.json", merged.data)
+        store.setModifiedTime("graph.json", modifiedTime: max(Self.nowMS(), remote.modifiedTime))
+        try await s3.putObjectConditional(
+            config.rootKey("graph.json"),
+            body: try store.readData("graph.json"),
+            expectedETag: remoteVersion.eTag
+        )
+        result.uploaded += 1
+        result.conflicts += merged.conflicts
+    }
+
+    private func mergeDrawingsWithRemote(_ remote: FileMeta, result: inout CBrainSyncResult) async throws {
+        progress("Merging drawings.json")
+        guard let remoteVersion = try await s3.getObjectVersion(config.rootKey("drawings.json")) else { return }
+        let remoteBytes = remoteVersion.body
+        let localBytes = try store.readData("drawings.json")
+        let baseBytes: Data?
+        if store.exists(Self.localDrawingsBasePath) {
+            baseBytes = try store.readData(Self.localDrawingsBasePath)
+        } else {
+            baseBytes = nil
+        }
+        let merged = try Self.mergeDrawingsData(local: localBytes, remote: remoteBytes, base: baseBytes)
+        if merged.conflicts > 0 {
+            let conflict = conflictPath("drawings.json", source: "local")
+            try store.writeData(conflict, localBytes)
+            try await upload(conflict)
+            result.uploaded += 1
+        }
+        try store.writeData("drawings.json", merged.data)
+        store.setModifiedTime("drawings.json", modifiedTime: max(Self.nowMS(), remote.modifiedTime))
+        try await s3.putObjectConditional(
+            config.rootKey("drawings.json"),
+            body: try store.readData("drawings.json"),
+            expectedETag: remoteVersion.eTag
+        )
+        result.uploaded += 1
+        result.conflicts += merged.conflicts
     }
 
     private func download(_ path: String, remote: FileMeta?) async throws {
@@ -179,10 +511,14 @@ final class CBrainSyncService {
 
     private func scanLocal() throws -> [String: FileMeta] {
         var output: [String: FileMeta] = [:]
+        let logicalTimes = localLogicalTimes()
         for file in store.listFilesRecursive() {
             if Self.skipLocal(file.path) { continue }
             let bytes = try store.readData(file.path)
-            let modifiedTime = Self.effectiveModifiedTime(path: file.path, bytes: bytes, fallback: file.modifiedTime)
+            var modifiedTime = Self.effectiveModifiedTime(path: file.path, bytes: bytes, fallback: file.modifiedTime)
+            if let logicalTime = logicalTimes[file.path], logicalTime > 0 {
+                modifiedTime = logicalTime
+            }
             output[file.path] = FileMeta(
                 path: file.path,
                 sha256: S3StorageClient.sha256Hex(bytes),
@@ -193,48 +529,57 @@ final class CBrainSyncService {
         return output
     }
 
-    private func readRemoteManifest() async throws -> [String: FileMeta] {
-        if let body = try await s3.getObject(config.rootKey(Self.manifestPath)), !body.isEmpty {
-            var manifest = try Self.parseManifest(String(decoding: body, as: UTF8.self))
-            await refreshRemoteGraphMeta(&manifest)
-            return manifest
+    private func localLogicalTimes() -> [String: Int64] {
+        guard store.exists("graph.json"),
+              let data = try? store.readData("graph.json"),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let graph = object as? [String: Any],
+              let nodes = graph["nodes"] as? [String: Any] else {
+            return [:]
         }
-        progress("No remote manifest. Building one from S3 objects...")
-        return try await scanRemoteObjects()
+        var output: [String: Int64] = [:]
+        for value in nodes.values {
+            guard let node = value as? [String: Any],
+                  let rawName = node["fileName"] as? String else { continue }
+            let fileName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if fileName.isEmpty { continue }
+            let noteName = fileName.lowercased().hasSuffix(".md") ? fileName : fileName + ".md"
+            let time = Self.graphItemTime(node)
+            if time > 0 { output["notes/" + noteName] = time }
+        }
+        return output
     }
 
-    private func scanRemoteObjects() async throws -> [String: FileMeta] {
+    private func readRemoteManifest() async throws -> [String: FileMeta] {
+        var cached: [String: FileMeta] = [:]
+        if let body = try await s3.getObject(config.rootKey(Self.manifestPath)), !body.isEmpty {
+            cached = try Self.parseManifest(String(decoding: body, as: UTF8.self))
+        } else {
+            progress("No remote manifest. Building one from S3 objects...")
+        }
+        return try await scanRemoteObjects(cached: cached)
+    }
+
+    private func scanRemoteObjects(cached: [String: FileMeta]) async throws -> [String: FileMeta] {
         var output: [String: FileMeta] = [:]
         let root = config.rootKey("")
         let listPrefix = root.isEmpty ? "" : root + "/"
         let objects = try await s3.listObjects(prefix: listPrefix)
         for object in objects {
+            try await refreshLockIfNeeded()
             guard let path = remotePath(key: object.key, root: root), !Self.skipLocal(path) else { continue }
             guard let bytes = try await s3.getObject(object.key) else { continue }
-            let modifiedTime = Self.effectiveModifiedTime(path: path, bytes: bytes, fallback: object.lastModified)
+            let sha256 = S3StorageClient.sha256Hex(bytes)
+            let fallback = cached[path]?.sha256 == sha256 ? cached[path]!.modifiedTime : object.lastModified
+            let modifiedTime = Self.effectiveModifiedTime(path: path, bytes: bytes, fallback: fallback)
             output[path] = FileMeta(
                 path: path,
-                sha256: S3StorageClient.sha256Hex(bytes),
+                sha256: sha256,
                 size: Int64(bytes.count),
                 modifiedTime: modifiedTime
             )
         }
         return output
-    }
-
-    private func refreshRemoteGraphMeta(_ manifest: inout [String: FileMeta]) async {
-        guard let graphMeta = manifest["graph.json"] else { return }
-        do {
-            guard let bytes = try await s3.getObject(config.rootKey("graph.json")) else { return }
-            let modifiedTime = Self.effectiveModifiedTime(path: "graph.json", bytes: bytes, fallback: graphMeta.modifiedTime)
-            manifest["graph.json"] = FileMeta(
-                path: "graph.json",
-                sha256: S3StorageClient.sha256Hex(bytes),
-                size: Int64(bytes.count),
-                modifiedTime: modifiedTime
-            )
-        } catch {
-        }
     }
 
     private func remotePath(key: String, root: String) -> String? {
@@ -244,8 +589,7 @@ final class CBrainSyncService {
     }
 
     private func acquireLock() async throws {
-        progress("Acquiring sync lock...")
-        let root = config.rootKey("")
+        progress("Acquiring \(activeLockType) lock...")
         var lockPrefix = config.rootKey(Self.lockPrefix)
         if !lockPrefix.isEmpty && !lockPrefix.hasSuffix("/") {
             lockPrefix += "/"
@@ -257,17 +601,80 @@ final class CBrainSyncService {
                 try await s3.deleteObject(lock.key)
                 continue
             }
-            if !lock.key.hasSuffix(clientId + ".json") {
-                let relative = remotePath(key: lock.key, root: root) ?? lock.key
-                throw CBrainError.message("Another client is syncing: \(relative)")
+            if lock.key == legacyLockKey() {
+                try await s3.deleteObject(lock.key)
+                continue
+            }
+            if activeLockType == Self.syncLockType {
+                if Self.isLockType(lock.key, type: Self.exclusiveLockType) {
+                    throw CBrainError.message("Sync target is being upgraded")
+                }
+            } else if lock.key != lockKey() {
+                throw CBrainError.message("Cannot acquire exclusive lock while sync target is active")
             }
         }
+        try await writeLock(now)
+
+        let verifiedLocks = try await s3.listObjects(prefix: lockPrefix)
+        var ownLockActive = false
+        var winningExclusive: S3ObjectInfo?
+        for lock in verifiedLocks where now - lock.lastModified <= Self.lockTimeoutMS {
+            if lock.key == lockKey() { ownLockActive = true }
+            if activeLockType == Self.syncLockType,
+               Self.isLockType(lock.key, type: Self.exclusiveLockType) {
+                try await s3.deleteObject(lockKey())
+                throw CBrainError.message("Exclusive lock appeared while acquiring sync lock")
+            }
+            if activeLockType == Self.exclusiveLockType {
+                if Self.isLockType(lock.key, type: Self.syncLockType) {
+                    try await s3.deleteObject(lockKey())
+                    throw CBrainError.message("Sync lock appeared while acquiring exclusive lock")
+                }
+                if Self.isLockType(lock.key, type: Self.exclusiveLockType) {
+                    if winningExclusive == nil
+                        || lock.lastModified < winningExclusive!.lastModified
+                        || (lock.lastModified == winningExclusive!.lastModified && lock.key < winningExclusive!.key) {
+                        winningExclusive = lock
+                    }
+                }
+            }
+        }
+        if !ownLockActive || (winningExclusive != nil && winningExclusive!.key != lockKey()) {
+            try await s3.deleteObject(lockKey())
+            throw CBrainError.message("Another client acquired the lock first")
+        }
+    }
+
+    private func refreshLockIfNeeded() async throws {
+        let now = Self.nowMS()
+        if now - lastLockRefresh < Self.lockRefreshIntervalMS { return }
+        var prefix = config.rootKey(Self.lockPrefix)
+        if !prefix.isEmpty && !prefix.hasSuffix("/") { prefix += "/" }
+        var ownLockActive = false
+        for lock in try await s3.listObjects(prefix: prefix) where now - lock.lastModified <= Self.lockTimeoutMS {
+            if lock.key == lockKey() {
+                ownLockActive = true
+            } else if activeLockType == Self.syncLockType,
+                      Self.isLockType(lock.key, type: Self.exclusiveLockType) {
+                throw CBrainError.message("Exclusive lock appeared during sync")
+            } else if activeLockType == Self.exclusiveLockType {
+                throw CBrainError.message("Another lock appeared during exclusive operation")
+            }
+        }
+        if !ownLockActive { throw CBrainError.message("Sync lock expired") }
+        try await writeLock(now)
+    }
+
+    private func writeLock(_ now: Int64) async throws {
         let body: [String: Any] = [
             "clientId": clientId,
+            "type": activeLockType,
+            "clientType": Self.lockClientType,
             "updatedTime": now
         ]
         let data = try JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys])
         try await s3.putObject(lockKey(), body: data)
+        lastLockRefresh = now
     }
 
     private func releaseLock() async throws {
@@ -275,17 +682,29 @@ final class CBrainSyncService {
     }
 
     private func lockKey() -> String {
+        config.rootKey(Self.lockPrefix + activeLockType + "_" + Self.lockClientType + "_" + clientId + ".json")
+    }
+
+    private func legacyLockKey() -> String {
         config.rootKey(Self.lockPrefix + clientId + ".json")
     }
 
-    private func conflictPath(_ path: String) -> String {
+    private static func isLockType(_ key: String, type: String) -> Bool {
+        let name = (key as NSString).lastPathComponent
+        return name.hasPrefix(type + "_")
+    }
+
+    private func conflictPath(_ path: String, source: String) -> String {
         let stamp = Self.conflictStamp()
+        let owner = String(clientId.prefix(8))
         let ns = path as NSString
         let folder = ns.deletingLastPathComponent
         let name = ns.lastPathComponent
         let ext = (name as NSString).pathExtension
         let base = ext.isEmpty ? name : (name as NSString).deletingPathExtension
-        let conflictName = ext.isEmpty ? "\(base).remote-conflict-\(stamp)" : "\(base).remote-conflict-\(stamp).\(ext)"
+        let conflictName = ext.isEmpty
+            ? "\(base).\(source)-conflict-\(stamp)-\(owner)"
+            : "\(base).\(source)-conflict-\(stamp)-\(owner).\(ext)"
         return folder.isEmpty || folder == "." ? conflictName : folder + "/" + conflictName
     }
 
@@ -294,6 +713,23 @@ final class CBrainSyncService {
         let repo = CBrainRepository(store: store)
         try repo.load()
         return try repo.importOrphanMarkdownNotes()
+    }
+
+    private func saveGraphBase() throws {
+        if store.exists("graph.json") {
+            try store.writeData(Self.localGraphBasePath, store.readData("graph.json"))
+        }
+    }
+
+    private func saveDrawingsBase() throws {
+        if store.exists("drawings.json") {
+            try store.writeData(Self.localDrawingsBasePath, store.readData("drawings.json"))
+        }
+    }
+
+    private func checkpoint(_ state: inout [String: FileMeta], path: String, meta: FileMeta?) throws {
+        state[path] = meta
+        UserDefaults.standard.set(try manifestJSON(state), forKey: stateKey)
     }
 
     private func manifestJSON(_ files: [String: FileMeta]) throws -> String {
@@ -341,20 +777,53 @@ final class CBrainSyncService {
     private static func skipLocal(_ path: String?) -> Bool {
         guard let path else { return true }
         let normalized = path.replacingOccurrences(of: "\\", with: "/")
-        return normalized == ".cbrain-sync" || normalized.hasPrefix(".cbrain-sync/")
+        return normalized == localTombstonesPath
+            || normalized == ".cbrain-sync" || normalized.hasPrefix(".cbrain-sync/")
+    }
+
+    private static func isContainerPath(_ path: String) -> Bool {
+        path == "graph.json" || path == "drawings.json"
+    }
+
+    private static func parseTombstones(_ data: Data) throws -> [String: Tombstone] {
+        var output: [String: Tombstone] = [:]
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = root["tombstones"] as? [String: Any] else {
+            return output
+        }
+        for (path, value) in items {
+            guard let item = value as? [String: Any] else { continue }
+            let deletedTime = int64(item["deletedTime"])
+            if deletedTime > 0 { output[path] = Tombstone(path: path, deletedTime: deletedTime) }
+        }
+        return output
+    }
+
+    private static func mergeTombstones(target: inout [String: Tombstone], source: [String: Tombstone]) {
+        for candidate in source.values {
+            if target[candidate.path] == nil || candidate.deletedTime > target[candidate.path]!.deletedTime {
+                target[candidate.path] = candidate
+            }
+        }
+    }
+
+    private func tombstonesJSON(_ tombstones: [String: Tombstone]) throws -> Data {
+        var items: [String: Any] = [:]
+        for path in tombstones.keys.sorted() {
+            guard let tombstone = tombstones[path] else { continue }
+            items[path] = ["deletedTime": tombstone.deletedTime]
+        }
+        let root: [String: Any] = [
+            "version": 1,
+            "updatedTime": Self.nowMS(),
+            "tombstones": items
+        ]
+        return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
     private static func same(_ a: FileMeta?, _ b: FileMeta?) -> Bool {
         guard let a, let b else { return a == nil && b == nil }
         return a.sha256 == b.sha256
-    }
-
-    private static func isRemoteNewer(remote: FileMeta, local: FileMeta) -> Bool {
-        remote.modifiedTime > local.modifiedTime
-    }
-
-    private static func isLocalNewer(local: FileMeta, remote: FileMeta) -> Bool {
-        local.modifiedTime > remote.modifiedTime
     }
 
     private static func effectiveModifiedTime(path: String, bytes: Data, fallback: Int64) -> Int64 {
@@ -370,6 +839,151 @@ final class CBrainSyncService {
         } catch {
             return fallback
         }
+    }
+
+    private static func mergeGraphData(local localData: Data, remote remoteData: Data, base baseData: Data?) throws -> GraphMergeResult {
+        guard var local = try JSONSerialization.jsonObject(with: localData) as? [String: Any],
+              let remote = try JSONSerialization.jsonObject(with: remoteData) as? [String: Any] else {
+            throw CBrainError.invalidLibrary
+        }
+        let base: [String: Any]?
+        if let baseData = baseData {
+            base = try JSONSerialization.jsonObject(with: baseData) as? [String: Any]
+        } else {
+            base = nil
+        }
+        var conflicts = 0
+        conflicts += mergeGraphSection(target: &local, source: remote, base: base, name: "nodes")
+        conflicts += mergeGraphSection(target: &local, source: remote, base: base, name: "links")
+        let data = try JSONSerialization.data(withJSONObject: local, options: [.prettyPrinted, .sortedKeys])
+        return GraphMergeResult(data: data, conflicts: conflicts)
+    }
+
+    private static func mergeGraphSection(target: inout [String: Any], source: [String: Any], base: [String: Any]?, name: String) -> Int {
+        var targetItems = target[name] as? [String: Any] ?? [:]
+        let sourceItems = source[name] as? [String: Any] ?? [:]
+        let baseItems = base?[name] as? [String: Any] ?? [:]
+        var conflicts = 0
+        for id in Set(targetItems.keys).union(sourceItems.keys) {
+            let localItem = targetItems[id] as? [String: Any]
+            let remoteItem = sourceItems[id] as? [String: Any]
+            let baseItem = baseItems[id] as? [String: Any]
+            if localItem == nil, let remoteItem {
+                targetItems[id] = remoteItem
+            } else if let localItem, let remoteItem, canonicalJSON(localItem) != canonicalJSON(remoteItem) {
+                let localChanged = baseItem == nil || canonicalJSON(localItem) != canonicalJSON(baseItem!)
+                let remoteChanged = baseItem == nil || canonicalJSON(remoteItem) != canonicalJSON(baseItem!)
+                if !localChanged && remoteChanged {
+                    targetItems[id] = remoteItem
+                } else if localChanged && remoteChanged {
+                    conflicts += 1
+                    if graphItemWins(candidate: remoteItem, current: localItem) {
+                        targetItems[id] = remoteItem
+                    }
+                }
+            }
+        }
+        target[name] = targetItems
+        return conflicts
+    }
+
+    private static func mergeDrawingsData(local localData: Data, remote remoteData: Data, base baseData: Data?) throws -> GraphMergeResult {
+        var local = try parseDrawingIndex(localData)
+        let remote = try parseDrawingIndex(remoteData)
+        let base: DrawingIndex?
+        if let baseData = baseData {
+            base = try parseDrawingIndex(baseData)
+        } else {
+            base = nil
+        }
+        var localItems = drawingMap(local.items)
+        let remoteItems = drawingMap(remote.items)
+        let baseItems = drawingMap(base?.items ?? [])
+        var conflicts = 0
+        for id in Set(localItems.keys).union(remoteItems.keys).union(baseItems.keys) {
+            let localItem = localItems[id]
+            let remoteItem = remoteItems[id]
+            let baseItem = baseItems[id]
+            if sameJSONItem(localItem, remoteItem) { continue }
+            if base == nil {
+                if localItem == nil, let remoteItem {
+                    localItems[id] = remoteItem
+                } else if let localItem, let remoteItem {
+                    conflicts += 1
+                    if graphItemWins(candidate: remoteItem, current: localItem) {
+                        localItems[id] = remoteItem
+                    }
+                }
+                continue
+            }
+            let localChanged = base == nil || !sameJSONItem(localItem, baseItem)
+            let remoteChanged = base == nil || !sameJSONItem(remoteItem, baseItem)
+            if !localChanged && remoteChanged {
+                localItems[id] = remoteItem
+            } else if localChanged && remoteChanged {
+                conflicts += 1
+                if localItem == nil, let remoteItem {
+                    localItems[id] = remoteItem
+                } else if let localItem, let remoteItem, graphItemWins(candidate: remoteItem, current: localItem) {
+                    localItems[id] = remoteItem
+                }
+            }
+        }
+        local.items = localItems.keys.sorted().compactMap { localItems[$0] }
+        let payload: Any
+        if local.arrayFormat {
+            payload = local.items
+        } else {
+            local.wrapper["value"] = local.items
+            local.wrapper["Count"] = local.items.count
+            payload = local.wrapper
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        return GraphMergeResult(data: data, conflicts: conflicts)
+    }
+
+    private static func parseDrawingIndex(_ data: Data) throws -> DrawingIndex {
+        let value = try JSONSerialization.jsonObject(with: data)
+        if let items = value as? [[String: Any]] {
+            return DrawingIndex(arrayFormat: true, wrapper: [:], items: items)
+        }
+        if let wrapper = value as? [String: Any] {
+            return DrawingIndex(arrayFormat: false, wrapper: wrapper, items: wrapper["value"] as? [[String: Any]] ?? [])
+        }
+        throw CBrainError.message("drawings.json must be an array or object")
+    }
+
+    private static func drawingMap(_ items: [[String: Any]]) -> [String: [String: Any]] {
+        var output: [String: [String: Any]] = [:]
+        for item in items {
+            let id = item["id"] as? String ?? ""
+            if !id.isEmpty { output[id] = item }
+        }
+        return output
+    }
+
+    private static func sameJSONItem(_ a: [String: Any]?, _ b: [String: Any]?) -> Bool {
+        guard let a, let b else { return a == nil && b == nil }
+        return canonicalJSON(a) == canonicalJSON(b)
+    }
+
+    private static func graphItemWins(candidate: [String: Any], current: [String: Any]) -> Bool {
+        let candidateTime = graphItemTime(candidate)
+        let currentTime = graphItemTime(current)
+        if candidateTime != currentTime { return candidateTime > currentTime }
+        return canonicalJSON(candidate) > canonicalJSON(current)
+    }
+
+    private static func graphItemTime(_ item: [String: Any]) -> Int64 {
+        max(
+            parseGraphTime(item["updateTime"] as? String ?? ""),
+            parseGraphTime(item["createTime"] as? String ?? "")
+        )
+    }
+
+    private static func canonicalJSON(_ value: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return "" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func maxJSONObjectTime(_ object: Any?, initial: Int64) -> Int64 {
@@ -418,6 +1032,22 @@ private struct FileMeta: Equatable {
     var sha256: String
     var size: Int64
     var modifiedTime: Int64
+}
+
+private struct Tombstone {
+    var path: String
+    var deletedTime: Int64
+}
+
+private struct GraphMergeResult {
+    var data: Data
+    var conflicts: Int
+}
+
+private struct DrawingIndex {
+    var arrayFormat: Bool
+    var wrapper: [String: Any]
+    var items: [[String: Any]]
 }
 
 private func int64(_ value: Any?) -> Int64 {

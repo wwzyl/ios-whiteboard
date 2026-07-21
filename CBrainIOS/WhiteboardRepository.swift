@@ -82,9 +82,11 @@ final class WhiteboardRepository {
     }
 
     func deleteDrawing(_ drawing: WhiteboardDrawing) throws {
+        let path = canvasPath(drawing.id)
+        try store.recordTombstone(path, deletedTime: Int64(Date().timeIntervalSince1970 * 1000))
         drawings.removeAll { wbString($0["id"]) == drawing.id }
         try saveIndex()
-        store.delete(canvasPath(drawing.id))
+        store.delete(path)
     }
 
     func usageInfo(for nodeId: String, excluding drawingId: String? = nil) -> String {

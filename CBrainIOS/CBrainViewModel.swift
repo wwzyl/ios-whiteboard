@@ -146,7 +146,7 @@ final class CBrainViewModel: ObservableObject {
             let deletedId = node.id
             let deletedTitle = node.topic
             let fallback = fallbackAfterDelete(node.id)
-            repository.deleteNoteFile(node)
+            try repository.deleteNoteFile(node)
             try repository.softDeleteNode(node.id)
             try repository.load()
             removeHistoryNode(deletedId)

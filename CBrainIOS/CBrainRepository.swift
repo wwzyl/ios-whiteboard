@@ -104,8 +104,9 @@ final class CBrainRepository {
         try saveGraph()
     }
 
-    func deleteNoteFile(_ node: CBrainNode) {
+    func deleteNoteFile(_ node: CBrainNode) throws {
         let path = notePath(node)
+        try store.recordTombstone(path, deletedTime: Int64(Date().timeIntervalSince1970 * 1000))
         store.delete(path)
         store.deleteMarkdownAliases(path)
         noteSearchCache.removeValue(forKey: Self.safeFileName(node.fileName))
@@ -194,6 +195,7 @@ final class CBrainRepository {
         let newPath = notePath(newNode)
         try store.writeMarkdownText(newPath, oldContent)
         if oldPath != newPath {
+            try store.recordTombstone(oldPath, deletedTime: Int64(Date().timeIntervalSince1970 * 1000))
             store.delete(oldPath)
         }
         try appendModify(nodeId: nodeId, nodeName: clean, type: "1", table: "cbNode", key: "topic", value: clean, comment: "修改节点topic", time: now)
@@ -537,7 +539,7 @@ final class CBrainRepository {
     }
 
     private static func isConflictFile(_ fileName: String) -> Bool {
-        fileName.contains(".remote-conflict-")
+        fileName.contains(".remote-conflict-") || fileName.contains(".local-conflict-")
     }
 
     private static func safeFileName(_ name: String) -> String {

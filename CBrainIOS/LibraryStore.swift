@@ -1,6 +1,7 @@
 import Foundation
 
 final class LibraryStore {
+    private static let tombstoneFile = ".cbrain-tombstones.json"
     let rootURL: URL
 
     init(rootURL: URL) {
@@ -96,6 +97,27 @@ final class LibraryStore {
 
     func delete(_ relativePath: String) {
         try? FileManager.default.removeItem(at: url(relativePath))
+    }
+
+    func recordTombstone(_ relativePath: String, deletedTime: Int64) throws {
+        let path = normalize(relativePath)
+        guard !path.isEmpty, deletedTime > 0 else { return }
+        var root: [String: Any] = [:]
+        if exists(Self.tombstoneFile),
+           let object = try? JSONSerialization.jsonObject(with: readData(Self.tombstoneFile)) as? [String: Any] {
+            root = object
+        }
+        var tombstones = root["tombstones"] as? [String: Any] ?? [:]
+        let current = tombstones[path] as? [String: Any]
+        let currentDeletedTime = (current?["deletedTime"] as? NSNumber)?.int64Value ?? 0
+        if currentDeletedTime < deletedTime {
+            tombstones[path] = ["deletedTime": deletedTime]
+        }
+        root["version"] = 1
+        root["updatedTime"] = Int64(Date().timeIntervalSince1970 * 1000)
+        root["tombstones"] = tombstones
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try writeData(Self.tombstoneFile, data)
     }
 
     func deleteMarkdownAliases(_ relativePath: String) {
