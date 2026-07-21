@@ -571,27 +571,57 @@ final class CBrainSyncService {
         let objects = try await s3.listObjects(prefix: listPrefix)
         try await ensureSyncTargetVersion()
         var fetched = 0
+        var processed = 0
+        var changed: [(S3ObjectInfo, String, FileMeta?)] = []
         for object in objects {
             try await refreshLockIfNeeded()
             guard let path = remotePath(key: object.key, root: root), !Self.skipLocal(path) else { continue }
-            if let cachedMeta = cached[path], !cachedMeta.eTag.isEmpty,
+            let cachedMeta = cached[path]
+            if let cachedMeta, !cachedMeta.eTag.isEmpty,
                cachedMeta.eTag == object.eTag, cachedMeta.size == object.size {
                 output[path] = cachedMeta
+                processed += 1
+                if processed % 50 == 0 {
+                    try store.writeData(Self.localRemoteDeltaPath, Data(try manifestJSON(output).utf8))
+                }
                 continue
             }
-            guard let bytes = try await s3.getObject(object.key) else { continue }
-            fetched += 1
-            if fetched % 10 == 0 { progress("Fetching changed remote files \(fetched)...") }
-            let sha256 = S3StorageClient.sha256Hex(bytes)
-            let fallback = cached[path]?.sha256 == sha256 ? cached[path]!.modifiedTime : object.lastModified
-            let modifiedTime = Self.effectiveModifiedTime(path: path, bytes: bytes, fallback: fallback)
-            output[path] = FileMeta(
-                path: path,
-                sha256: sha256,
-                size: Int64(bytes.count),
-                modifiedTime: modifiedTime,
-                eTag: object.eTag
-            )
+            changed.append((object, path, cachedMeta))
+        }
+        for start in stride(from: 0, to: changed.count, by: 4) {
+            try await refreshLockIfNeeded()
+            let end = min(start + 4, changed.count)
+            let batch = Array(changed[start..<end])
+            let results = try await withThrowingTaskGroup(of: RemoteFetchedFile?.self) { group in
+                for (object, path, cachedMeta) in batch {
+                    group.addTask {
+                        guard let bytes = try await self.s3.getObject(object.key) else { return nil }
+                        let sha256 = S3StorageClient.sha256Hex(bytes)
+                        let fallback = cachedMeta?.sha256 == sha256 ? cachedMeta!.modifiedTime : object.lastModified
+                        return RemoteFetchedFile(meta: FileMeta(
+                            path: path,
+                            sha256: sha256,
+                            size: Int64(bytes.count),
+                            modifiedTime: Self.effectiveModifiedTime(path: path, bytes: bytes, fallback: fallback),
+                            eTag: object.eTag
+                        ))
+                    }
+                }
+                var files: [RemoteFetchedFile] = []
+                for try await result in group {
+                    if let result { files.append(result) }
+                }
+                return files
+            }
+            for result in results {
+                output[result.meta.path] = result.meta
+                fetched += 1
+                processed += 1
+                if fetched % 10 == 0 { progress("Fetching changed remote files \(fetched)...") }
+                if processed % 50 == 0 {
+                    try store.writeData(Self.localRemoteDeltaPath, Data(try manifestJSON(output).utf8))
+                }
+            }
         }
         return output
     }
@@ -603,6 +633,25 @@ final class CBrainSyncService {
     }
 
     private func acquireLock() async throws {
+        if activeLockType != Self.exclusiveLockType {
+            try await acquireLockOnce()
+            return
+        }
+        var lastError: Error?
+        for attempt in 0..<30 {
+            do {
+                try await acquireLockOnce()
+                return
+            } catch {
+                lastError = error
+                if attempt == 29 { throw error }
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        throw lastError ?? CBrainError.message("Could not acquire exclusive lock")
+    }
+
+    private func acquireLockOnce() async throws {
         progress("Acquiring \(activeLockType) lock...")
         var lockPrefix = config.rootKey(Self.lockPrefix)
         if !lockPrefix.isEmpty && !lockPrefix.hasSuffix("/") {
@@ -1042,6 +1091,10 @@ private struct FileMeta: Equatable {
     var size: Int64
     var modifiedTime: Int64
     var eTag: String = ""
+}
+
+private struct RemoteFetchedFile {
+    var meta: FileMeta
 }
 
 private struct Tombstone {
